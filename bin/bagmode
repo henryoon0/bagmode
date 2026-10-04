@@ -1,0 +1,140 @@
+#!/bin/bash
+# Bag mode: keep the Mac awake with the lid closed, for a time you choose.
+# It turns off by itself when the time ends, the battery drops below
+# BAGMODE_MIN_BATTERY, or you connect the charger.
+#
+#   bagmode            toggle (ask for time when turning on)
+#   bagmode on [min]   turn on (ask for time if no minutes given)
+#   bagmode off        turn off
+#   bagmode status     show state
+#   bagmode doctor     print diagnostics to paste into an issue
+#   bagmode login-check  reset a mode left on after a crash or reboot
+set -u
+
+STATE="$HOME/.bagmode"
+PIDF="$STATE/watcher.pid"
+CONF="$STATE/config"
+PMSET=/usr/bin/pmset
+
+# Defaults. Change them in ~/.bagmode/config (KEY=value lines).
+BAGMODE_DEFAULT_MIN=60
+BAGMODE_MAX_MIN=240
+BAGMODE_MIN_BATTERY=20
+# shellcheck disable=SC1090
+[ -f "$CONF" ] && . "$CONF"
+
+mkdir -p "$STATE"
+
+if defaults read -g AppleLanguages 2>/dev/null | sed -n 2p | grep -q '"ko'; then LANG_KO=1; else LANG_KO=0; fi
+t() { if [ "$LANG_KO" = 1 ]; then printf '%s' "$1"; else printf '%s' "$2"; fi; }
+
+battery()  { $PMSET -g batt | grep -o '[0-9]*%' | head -1 | tr -d %; }
+on_ac()    { $PMSET -g batt | grep -q "AC Power"; }
+is_on()    { [ -f "$PIDF" ] && kill -0 "$(cat "$PIDF")" 2>/dev/null; }
+sleep_off(){ $PMSET -g | grep -q "SleepDisabled[[:space:]]*1"; }
+
+esc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+popup() { # title, message, buttons (AppleScript list body), default button
+  osascript -e "display dialog \"$(esc "$2")\" with title \"$(esc "$1")\" buttons {$3} default button \"$4\"" 2>/dev/null
+}
+notice() { popup "$1" "$2" "\"OK\"" "OK" >/dev/null; }
+
+set_sleep() { sudo -n "$PMSET" -a disablesleep "$1" 2>/dev/null; }
+
+ask_minutes() {
+  local l30 l60 l120 lcustom pick
+  l30=$(t "30분" "30 min"); l60=$(t "1시간" "1 hour"); l120=$(t "2시간" "2 hours")
+  lcustom=$(t "직접 입력…" "Custom…")
+  pick=$(osascript -e "choose from list {\"$l30\", \"$l60\", \"$l120\", \"$lcustom\"} with title \"Bag Mode\" with prompt \"$(t "🎒 가방 모드를 얼마나 켤까요?" "🎒 How long should bag mode stay on?")\" default items {\"$l60\"}" 2>/dev/null)
+  case "$pick" in
+    "$l30") echo 30 ;;
+    "$l60") echo 60 ;;
+    "$l120") echo 120 ;;
+    "$lcustom")
+      osascript -e "text returned of (display dialog \"$(t "몇 분 동안 켤까요? (1~$BAGMODE_MAX_MIN)" "Minutes (1-$BAGMODE_MAX_MIN):")\" with title \"Bag Mode\" default answer \"$BAGMODE_DEFAULT_MIN\")" 2>/dev/null ;;
+    *) echo "" ;; # cancelled
+  esac
+}
+
+turn_off() { # reason
+  set_sleep 0
+  rm -f "$PIDF"
+  notice "$(t "가방 모드 꺼짐" "Bag mode off")" \
+    "$(t "이유: $1" "Reason: $1")
+$(t "이제 덮개를 닫으면 평소처럼 잠들어요." "The Mac will sleep normally when you close the lid.")"
+}
+
+stop() {
+  if is_on; then kill "$(cat "$PIDF")" 2>/dev/null; fi
+  turn_off "$1"
+}
+
+watch() { # minutes
+  local end was_ac=0 b
+  end=$(( $(date +%s) + $1 * 60 ))
+  on_ac && was_ac=1
+  while sleep 20; do
+    [ -f "$PIDF" ] || exit 0
+    if [ "$(date +%s)" -ge "$end" ]; then
+      turn_off "$(t "$1분이 지났어요" "$1 minutes passed")"; exit 0
+    fi
+    b=$(battery)
+    if [ -n "$b" ] && [ "$b" -lt "$BAGMODE_MIN_BATTERY" ]; then
+      turn_off "$(t "배터리가 ${BAGMODE_MIN_BATTERY}% 아래로 떨어졌어요" "Battery is below ${BAGMODE_MIN_BATTERY}%")"; exit 0
+    fi
+    if on_ac; then
+      if [ "$was_ac" = 0 ]; then turn_off "$(t "충전기가 연결됐어요" "Charger connected")"; exit 0; fi
+    else
+      was_ac=0
+    fi
+  done
+}
+
+start() { # [minutes]
+  local min="${1:-}" until ans
+  [ -n "$min" ] || min=$(ask_minutes)
+  [ -n "$min" ] || exit 0
+  if ! [[ "$min" =~ ^[0-9]+$ ]] || [ "$min" -lt 1 ] || [ "$min" -gt "$BAGMODE_MAX_MIN" ]; then
+    notice "Bag Mode" "$(t "1~${BAGMODE_MAX_MIN} 사이 숫자로 입력해 주세요." "Enter a number from 1 to ${BAGMODE_MAX_MIN}.")"
+    exit 1
+  fi
+  if ! set_sleep 1; then
+    notice "Bag Mode" "$(t "권한이 없어서 켜지 못했어요. 설치 명령을 다시 실행해 주세요." "No permission to change sleep settings. Run the installer again.")"
+    exit 1
+  fi
+  nohup "$0" __watch "$min" >/dev/null 2>&1 &
+  echo $! > "$PIDF"
+  until=$(date -v+"${min}"M "+%H:%M")
+  ans=$(popup "$(t "🎒 가방 모드 켜짐" "🎒 Bag mode on")" \
+    "$(t "덮개를 닫아도 작업이 계속돼요." "Work keeps running with the lid closed.")
+$(t "자동 해제: $until (${min}분 뒤)" "Turns off at $until (in $min min)")" \
+    "\"$(t "지금 끄기" "Turn off now")\", \"OK\"" "OK")
+  if [[ "$ans" == *"$(t "지금 끄기" "Turn off now")"* ]]; then stop "$(t "직접 껐어요" "Turned off by you")"; fi
+}
+
+case "${1:-}" in
+  __watch) watch "$2" ;;
+  on)      is_on || start "${2:-}" ;;
+  off)     stop "$(t "직접 껐어요" "Turned off by you")" ;;
+  status)
+    if is_on; then echo "on"; else echo "off"; fi ;;
+  login-check)
+    # The pmset setting survives a reboot, but the watcher does not.
+    if ! is_on && sleep_off; then
+      set_sleep 0; rm -f "$PIDF"
+      notice "$(t "가방 모드 꺼짐" "Bag mode off")" \
+        "$(t "재시작 전에 켜져 있던 가방 모드를 껐어요." "Bag mode was still on from before a restart. It is now off.")"
+    fi ;;
+  doctor)
+    echo "macOS: $(sw_vers -productVersion) $(uname -m)"
+    echo "bagmode: $0"
+    echo "state: $(is_on && echo on || echo off)"
+    echo "SleepDisabled: $(sleep_off && echo 1 || echo 0)"
+    echo "permission: $(sudo -n -l "$PMSET" -a disablesleep 1 >/dev/null 2>&1 && echo ok || echo missing)"
+    echo "battery: $(battery)% $(on_ac && echo AC || echo battery)"
+    echo "hammerspoon: $([ -d /Applications/Hammerspoon.app ] || [ -d "$HOME/Applications/Hammerspoon.app" ] && echo installed || echo missing)"
+    echo "hotkey file: $([ -f "$HOME/.hammerspoon/bagmode.lua" ] && echo ok || echo missing)"
+    echo "login agent: $(launchctl print "gui/$(id -u)/io.github.bagmode.login-check" >/dev/null 2>&1 && echo loaded || echo missing)" ;;
+  *)
+    if is_on; then stop "$(t "직접 껐어요" "Turned off by you")"; else start; fi ;;
+esac

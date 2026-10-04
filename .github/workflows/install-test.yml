@@ -1,0 +1,55 @@
+name: install-test
+on: [push, pull_request, workflow_dispatch]
+
+jobs:
+  macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install (no Homebrew in PATH)
+        run: env PATH=/usr/bin:/bin:/usr/sbin:/sbin bash install.sh
+      - name: Check install
+        run: |
+          ~/.bagmode/bin/bagmode doctor
+          ~/.bagmode/bin/bagmode doctor | grep -q "permission: ok"
+          test -f ~/Library/LaunchAgents/io.github.bagmode.login-check.plist
+          sudo -n /usr/bin/pmset -a disablesleep 1
+          pmset -g | grep -q "SleepDisabled[[:space:]]*1"
+          ~/.bagmode/bin/bagmode login-check </dev/null &
+          sleep 5
+          pmset -g | grep -q "SleepDisabled[[:space:]]*0"
+          pkill osascript || true
+      - name: Second install gives the same result
+        run: |
+          shasum ~/.bagmode/bin/bagmode ~/.bagmode/config > "$RUNNER_TEMP/a"
+          env PATH=/usr/bin:/bin:/usr/sbin:/sbin bash install.sh
+          shasum ~/.bagmode/bin/bagmode ~/.bagmode/config > "$RUNNER_TEMP/b"
+          diff "$RUNNER_TEMP/a" "$RUNNER_TEMP/b"
+      - name: Uninstall
+        run: |
+          bash uninstall.sh </dev/null
+          test ! -e ~/.bagmode
+          test ! -e ~/Library/LaunchAgents/io.github.bagmode.login-check.plist
+          test ! -e /etc/sudoers.d/bagmode
+
+  unsupported-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          set +e
+          out="$(bash install.sh 2>&1)"; code=$?
+          echo "$out"
+          test $code -ne 0
+          echo "$out" | grep -q "Nothing was changed"
+          test ! -e ~/.bagmode
+
+  line-endings:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: "! git ls-files '*.sh' bin | xargs grep -l $'\\r'"
